@@ -1,0 +1,283 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI 代码生成平台</title>
+    <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:opsz@14..32&display=swap" rel="stylesheet">
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: 'Inter', sans-serif; background: #f8fafd; height: 100vh; color: #1e1f22; }
+        #app { display: flex; height: 100%; }
+        .sidebar {
+            width: 280px; background: rgba(255,255,255,0.8); backdrop-filter: blur(20px);
+            border-right: 1px solid rgba(0,0,0,0.06); display: flex; flex-direction: column;
+        }
+        .sidebar-header { padding: 24px 20px 16px; font-weight: 600; font-size: 1.2rem; }
+        .new-chat-btn {
+            margin: 8px 16px; padding: 12px; background: #1e1f22; border: none; border-radius: 30px;
+            color: white; font-weight: 500; cursor: pointer; box-shadow: 0 2px 8px rgba(0,0,0,0.05);
+        }
+        .clear-chat-btn {
+            margin: 0 16px 20px; padding: 10px; background: rgba(0,0,0,0.02); border: 1px solid rgba(0,0,0,0.08);
+            border-radius: 30px; color: #5f6368; font-weight: 500; cursor: pointer;
+        }
+        .task-list { flex: 1; overflow-y: auto; padding: 8px 12px; }
+        .task-item {
+            padding: 12px 16px; margin-bottom: 4px; border-radius: 14px; cursor: pointer;
+            color: #2c2e33; border: 1px solid transparent; transition: 0.15s;
+        }
+        .task-item:hover { background: rgba(0,0,0,0.03); border-color: rgba(0,0,0,0.04); }
+        .task-item.active { background: rgba(0,0,0,0.05); font-weight: 500; }
+        .task-title { font-size: 0.9rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .task-id { font-size: 0.7rem; color: #5f6368; font-family: monospace; margin-top: 4px; }
+        .main-content {
+            flex: 1; display: flex; flex-direction: column; background: #fff;
+            border-radius: 32px 0 0 32px; box-shadow: -4px 0 30px rgba(0,0,0,0.02);
+        }
+        .chat-messages { flex: 1; overflow-y: auto; padding: 32px 24px; }
+        .message { margin-bottom: 24px; display: flex; animation: fadeIn 0.3s; }
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: translateY(0); } }
+        .message.user { justify-content: flex-end; }
+        .message-content {
+            max-width: 82%; padding: 14px 20px; border-radius: 24px; line-height: 1.55;
+            font-size: 0.95rem; box-shadow: 0 2px 6px rgba(0,0,0,0.02);
+        }
+        .message.user .message-content { background: #1e1f22; color: white; border-bottom-right-radius: 8px; }
+        .message.assistant .message-content {
+            background: #f2f3f7; color: #1e1f22; border-bottom-left-radius: 8px;
+            border: 1px solid rgba(0,0,0,0.02);
+        }
+        .message pre {
+            background: #fff; padding: 14px 16px; border-radius: 18px; overflow-x: auto;
+            margin-top: 12px; border: 1px solid rgba(0,0,0,0.06);
+        }
+        .input-area { padding: 20px 28px 28px; border-top: 1px solid rgba(0,0,0,0.05); }
+        .input-group {
+            display: flex; gap: 12px; background: #f2f3f7; padding: 6px 6px 6px 20px;
+            border-radius: 60px; border: 1px solid rgba(0,0,0,0.04);
+        }
+        .input-group:focus-within { background: #fff; box-shadow: 0 6px 20px rgba(0,0,0,0.04); }
+        .input-group input {
+            flex: 1; padding: 14px 0; font-size: 1rem; background: transparent;
+            border: none; color: #1e1f22; outline: none;
+        }
+        .input-group input::placeholder { color: #8a8f99; }
+        .input-group button {
+            padding: 0 28px; background: #1e1f22; border: none; border-radius: 60px;
+            color: white; font-weight: 500; cursor: pointer;
+        }
+        .download-btn {
+            display: inline-flex; align-items: center; margin-top: 18px; padding: 10px 22px;
+            background: #fff; color: #1e1f22 !important; border-radius: 60px;
+            text-decoration: none; font-weight: 500; border: 1px solid rgba(0,0,0,0.08);
+            box-shadow: 0 2px 8px rgba(0,0,0,0.02);
+        }
+        .loading-dots::after { content: '...'; animation: dots 1.5s infinite; }
+        @keyframes dots { 0%,20%{ content: '.'; } 40%,60%{ content: '..'; } 80%,100%{ content: '...'; } }
+        .status-badge { font-size: 0.8rem; margin-left: 8px; opacity: 0.7; }
+        ::-webkit-scrollbar { width: 5px; }
+        ::-webkit-scrollbar-thumb { background: rgba(0,0,0,0.15); border-radius: 20px; }
+    </style>
+</head>
+<body>
+<div id="app">
+    <div class="sidebar">
+        <div class="sidebar-header">📋 对话历史</div>
+        <button class="new-chat-btn" @click="newChat">✨ 新对话</button>
+        <button class="clear-chat-btn" @click="clearAllConversations">🧹 清除历史</button>
+        <div class="task-list">
+            <div v-for="conv in conversations" :key="conv.id"
+                 class="task-item" :class="{ active: currentConversationId === conv.id }"
+                 @click="selectConversation(conv.id)">
+                <div class="task-title">{{ conv.title || '新对话' }}</div>
+                <div class="task-id">{{ conv.id.substring(0,8) }}...</div>
+            </div>
+            <div v-if="conversations.length === 0" style="padding:24px 12px;color:#5f6368;text-align:center;">✨ 开始新对话</div>
+        </div>
+    </div>
+    <div class="main-content">
+        <div class="chat-messages" ref="chatContainer">
+            <div v-for="(msg, index) in messages" :key="index" class="message" :class="msg.role">
+                <div class="message-content">
+                    <span v-if="msg.role === 'assistant' && msg.isLoading" class="status-badge">{{ msg.statusText }}</span>
+                    <div v-html="formatContent(msg.content)"></div>
+                </div>
+            </div>
+        </div>
+        <div class="input-area">
+            <div class="input-group">
+                <input type="text" v-model="inputMessage" placeholder="输入消息…" @keypress.enter.prevent="sendMessage" :disabled="isProcessing">
+                <button @click="sendMessage" :disabled="isProcessing || !inputMessage.trim()">发送</button>
+            </div>
+        </div>
+    </div>
+</div>
+<script>
+    const { createApp, ref, reactive, onMounted, onUnmounted, nextTick } = Vue;
+    const API_BASE = '/api';
+
+    const app = createApp({
+        setup() {
+            const conversations = ref([]);
+            const currentConversationId = ref(null);
+            const messages = ref([{ role: 'assistant', content: '👋 你好！开始对话吧。' }]);
+            const inputMessage = ref('');
+            const isProcessing = ref(false);
+            let pollInterval = null;
+            let currentPollTaskId = null;
+            const chatContainer = ref(null);
+
+            // 格式化内容：识别下载按钮标记，处理代码块
+            const formatContent = (content) => {
+                if (!content) return '';
+                let formatted = content;
+                formatted = formatted.replace(/\[DOWNLOAD_BUTTON:(.*?)\]/g, (_, url) => `<a href="${url}" target="_blank" class="download-btn">📦 下载代码包</a>`);
+                if (formatted.includes('```')) {
+                    formatted = formatted.replace(/```(\w*)\n([\s\S]*?)```/g, '<pre><code>$2</code></pre>');
+                }
+                return formatted.replace(/\n/g, '<br>');
+            };
+
+            const scrollToBottom = () => nextTick(() => { if (chatContainer.value) chatContainer.value.scrollTop = chatContainer.value.scrollHeight; });
+
+            // 加载会话列表
+            const loadConversations = async () => {
+                try {
+                    const res = await fetch(`${API_BASE}/conversations`);
+                    const data = await res.json();
+                    conversations.value = Array.isArray(data) ? data : [];
+                    // 自动选中第一个会话（仅在无选中且列表非空时）
+                    if (conversations.value.length > 0 && !currentConversationId.value) {
+                        await selectConversation(conversations.value[0].id);
+                    }
+                } catch (e) {
+                    console.error('加载会话失败:', e);
+                    conversations.value = [];
+                }
+            };
+
+            // 选中会话并加载消息
+            const selectConversation = async (id) => {
+                currentConversationId.value = id;
+                try {
+                    const res = await fetch(`${API_BASE}/conversations/${id}/messages`);
+                    const msgs = await res.json();
+                    messages.value = msgs.length ? msgs : [{ role: 'assistant', content: '👋 对话历史为空' }];
+                } catch (e) {
+                    messages.value = [{ role: 'assistant', content: '❌ 加载历史失败' }];
+                }
+                scrollToBottom();
+            };
+
+            // 新建对话
+            const newChat = () => {
+                stopPolling();
+                currentConversationId.value = null;
+                messages.value = [{ role: 'assistant', content: '✨ 新对话！输入你的需求。' }];
+            };
+
+            // 清除所有会话
+            const clearAllConversations = async () => {
+                if (!confirm('确定清除所有历史对话吗？')) return;
+                try {
+                    for (const c of conversations.value) {
+                        await fetch(`${API_BASE}/conversations/${c.id}`, { method: 'DELETE' });
+                    }
+                    conversations.value = [];
+                    newChat();
+                } catch (e) {
+                    alert('清除失败: ' + e.message);
+                }
+            };
+
+            const stopPolling = () => {
+                if (pollInterval) { clearInterval(pollInterval); pollInterval = null; }
+                currentPollTaskId = null;
+            };
+
+            // 发送消息
+            const sendMessage = async () => {
+                const msg = inputMessage.value.trim();
+                if (!msg || isProcessing.value) return;
+                inputMessage.value = '';
+                isProcessing.value = true;
+                messages.value.push({ role: 'user', content: msg });
+                const loadingMsg = reactive({ role: 'assistant', content: '⏳ 正在思考…', isLoading: true, statusText: '思考中' });
+                messages.value.push(loadingMsg);
+                scrollToBottom();
+
+                try {
+                    let url = `${API_BASE}/submit?task=${encodeURIComponent(msg)}`;
+                    if (currentConversationId.value) url += `&conversation_id=${currentConversationId.value}`;
+                    const res = await fetch(url, { method: 'POST' });
+                    const data = await res.json();
+                    if (!data.task_id) throw new Error('未获取任务ID');
+                    const taskId = data.task_id;
+
+                    // 刷新会话列表（确保新会话或标题更新）
+                    await loadConversations();
+
+                    // 如果是新创建的会话，切换到该会话
+                    if (!currentConversationId.value) {
+                        currentConversationId.value = data.conversation_id;
+                        await selectConversation(data.conversation_id);
+                    }
+
+                    stopPolling();
+                    currentPollTaskId = taskId;
+                    let attempts = 0;
+                    pollInterval = setInterval(async () => {
+                        attempts++;
+                        try {
+                            const r = await fetch(`${API_BASE}/result?id=${taskId}`);
+                            if (r.status === 200) {
+                                const task = await r.json();
+                                if (task.status === 'done') {
+                                    stopPolling();
+                                    const idx = messages.value.indexOf(loadingMsg);
+                                    if (idx !== -1) messages.value.splice(idx, 1, { role: 'assistant', content: task.result });
+                                    // 再次刷新会话列表（标题可能已更新）
+                                    await loadConversations();
+                                    isProcessing.value = false;
+                                } else {
+                                    loadingMsg.statusText = `${task.status}…`;
+                                }
+                            }
+                        } catch (e) {
+                            loadingMsg.statusText = `网络波动…`;
+                        }
+                        if (attempts >= 180) {
+                            stopPolling();
+                            const idx = messages.value.indexOf(loadingMsg);
+                            if (idx !== -1) messages.value.splice(idx, 1, { role: 'assistant', content: '⏰ 任务超时' });
+                            isProcessing.value = false;
+                            await loadConversations();
+                        }
+                        scrollToBottom();
+                    }, 2500);
+                } catch (e) {
+                    stopPolling();
+                    const idx = messages.value.indexOf(loadingMsg);
+                    if (idx !== -1) messages.value.splice(idx, 1, { role: 'assistant', content: `❌ 错误: ${e.message}` });
+                    isProcessing.value = false;
+                    await loadConversations();
+                }
+            };
+
+            onMounted(() => {
+                loadConversations();
+                setInterval(loadConversations, 30000); // 每30秒静默刷新
+            });
+            onUnmounted(() => stopPolling());
+
+            return {
+                conversations, currentConversationId, messages, inputMessage, isProcessing,
+                chatContainer, formatContent, selectConversation, newChat, clearAllConversations, sendMessage
+            };
+        }
+    }).mount('#app');
+</script>
+</body>
+</html>
