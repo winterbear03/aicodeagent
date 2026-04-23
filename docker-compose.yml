@@ -57,6 +57,9 @@ services:
       MINIO_ACCESS_KEY: minioadmin
       MINIO_SECRET_KEY: minioadmin
       ZHIPU_API_KEY: ${ZHIPU_API_KEY}
+    dns:                           # ← 新增的 DNS 配置
+      - 114.114.114.114
+      - 8.8.8.8
     volumes:
       - ./frontend:/root/frontend
 

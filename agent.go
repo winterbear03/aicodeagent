@@ -4,10 +4,12 @@ import (
 	"archive/zip"
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -78,23 +80,21 @@ type Tool interface {
 
 // ---------- 代码生成工具（支持上下文）----------
 type CodeGenTool struct {
-	ConversationID string // 新增：会话ID，用于获取历史
+	ConversationID string
 }
 
 func (t CodeGenTool) Name() string        { return "code_generator" }
 func (t CodeGenTool) Description() string { return "调用大模型生成代码" }
 func (t CodeGenTool) Execute(ctx context.Context, input string) (string, error) {
-	// 获取该会话的历史消息
 	history := getConversationHistory(t.ConversationID)
 	code := callZhipuAIWithHistory(input, history)
 
-	if code == "" || strings.HasPrefix(code, "❌") || strings.HasPrefix(code, "AI 返回为空") {
+	if code == "" || strings.HasPrefix(code, "[ERROR]") || strings.HasPrefix(code, "AI returned empty") {
 		return code, nil
 	}
 	return uploadCodeToMinIO(ctx, code)
 }
 
-// 获取会话的历史消息（用于上下文）
 func getConversationHistory(convID string) []map[string]string {
 	if convID == "" {
 		return nil
@@ -114,10 +114,9 @@ func getConversationHistory(convID string) []map[string]string {
 func callZhipuAIWithHistory(prompt string, history []map[string]string) string {
 	apiKey := os.Getenv("ZHIPU_API_KEY")
 	if apiKey == "" {
-		return "❌ 未配置 ZHIPU_API_KEY"
+		return "[ERROR] ZHIPU_API_KEY not set"
 	}
 
-	// 构建消息列表
 	messages := []map[string]string{
 		{"role": "system", "content": "你是一个专业的编程助手，擅长生成各类代码。如果用户追问或要求修改，请基于之前的对话内容进行回答。"},
 	}
@@ -133,7 +132,26 @@ func callZhipuAIWithHistory(prompt string, history []map[string]string) string {
 	req, _ := http.NewRequest("POST", "https://open.bigmodel.cn/api/paas/v4/chat/completions", bytes.NewBuffer(data))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+apiKey)
-	client := &http.Client{Timeout: 60 * time.Second}
+
+	client := &http.Client{
+		Timeout: 60 * time.Second,
+		Transport: &http.Transport{
+			DialContext: (&net.Dialer{
+				Timeout:   10 * time.Second,
+				KeepAlive: 30 * time.Second,
+			}).DialContext,
+			TLSHandshakeTimeout:   15 * time.Second,
+			ResponseHeaderTimeout: 30 * time.Second,
+			IdleConnTimeout:       90 * time.Second,
+			MaxIdleConns:          10,
+			ForceAttemptHTTP2:     false,
+			TLSClientConfig: &tls.Config{
+				MinVersion: tls.VersionTLS12,
+				MaxVersion: tls.VersionTLS13,
+			},
+		},
+	}
+
 	resp, err := client.Do(req)
 	if err != nil {
 		return fmt.Sprintf("AI 调用失败: %v", err)
@@ -250,7 +268,7 @@ var bucketName = "ai-platform"
 func initMinIO() {
 	endpoint := os.Getenv("MINIO_ENDPOINT")
 	if endpoint == "" {
-		log.Println("⚠️ 未配置 MINIO_ENDPOINT，截图/打包功能将受限")
+		log.Println("[WARN] MINIO_ENDPOINT 未设置，截图/打包功能将受限")
 		return
 	}
 	accessKey := os.Getenv("MINIO_ACCESS_KEY")
@@ -267,7 +285,7 @@ func initMinIO() {
 		Secure: false,
 	})
 	if err != nil {
-		log.Printf("⚠️ MinIO 连接失败: %v", err)
+		log.Printf("[WARN] MinIO 连接失败: %v", err)
 		minioClient = nil
 		return
 	}
@@ -277,12 +295,12 @@ func initMinIO() {
 	if !exists {
 		minioClient.MakeBucket(ctx, bucketName, minio.MakeBucketOptions{})
 	}
-	log.Println("✅ MinIO connected")
+	log.Println("[OK] MinIO 已连接")
 }
 
 func uploadCodeToMinIO(ctx context.Context, code string) (string, error) {
 	if minioClient == nil {
-		return code + "\n\n⚠️ MinIO未连接", nil
+		return code + "\n\n[WARN] MinIO 未连接", nil
 	}
 
 	contentType := "text/plain"
@@ -300,7 +318,7 @@ func uploadCodeToMinIO(ctx context.Context, code string) (string, error) {
 		ContentType: contentType,
 	})
 	if err != nil {
-		return code + "\n\n❌ 上传失败", nil
+		return code + "\n\n[ERROR] 上传失败", nil
 	}
 
 	reqParams := make(url.Values)
@@ -370,7 +388,7 @@ func (w *Workflow) Execute(ctx context.Context) error {
 	return nil
 }
 
-// ========== Agent 核心（支持上下文） ==========
+// ========== Agent 核心（扩展触发词） ==========
 type Agent struct {
 	tools map[string]Tool
 }
@@ -387,21 +405,42 @@ func (a *Agent) Register(t Tool) { a.tools[t.Name()] = t }
 
 func (a *Agent) DecideTool(input string) string {
 	lower := strings.ToLower(input)
-	if strings.Contains(lower, "截图") {
+
+	// 截图
+	if strings.Contains(lower, "截图") || strings.Contains(lower, "screenshot") ||
+		strings.Contains(lower, "capture") || strings.Contains(lower, "预览") {
 		return "screenshot"
 	}
-	if strings.Contains(lower, "打包") {
+	// 打包/下载
+	if strings.Contains(lower, "打包") || strings.Contains(lower, "package") ||
+		strings.Contains(lower, "下载") || strings.Contains(lower, "bundle") {
 		return "workflow"
 	}
-	actionWords := []string{"写", "生成", "实现", "创建", "开发", "编写", "帮我", "输出", "改成", "修改", "加上", "去掉", "优化", "重构"}
-	techWords := []string{"gin", "go", "接口", "api", "代码", "sql", "vue", "html", "css", "c++", "python", "java", "javascript"}
-	hasAction, hasTech := false, false
+
+	// 代码生成：丰富的中文动作词 + 技术栈关键词
+	actionWords := []string{
+		"写", "生成", "实现", "创建", "开发", "编写", "帮我", "输出",
+		"改成", "修改", "加上", "去掉", "优化", "重构",
+		"做个", "弄个", "搞个", "整个", "来个", "新建", "构建",
+		"做", "弄", "搞", "整", "来", "设计", "制作", "定制",
+		"write", "generate", "create", "implement", "develop", "code",
+		"build", "make", "do", "help", "output",
+	}
+	techWords := []string{
+		"gin", "go", "接口", "api", "代码", "sql", "vue", "html", "css",
+		"c++", "python", "java", "javascript", "typescript", "react",
+		"node", "django", "flask", "spring", "rust", "typescript",
+		"hello world", "rest", "grpc", "gorm", "docker", "k8s",
+	}
+
+	hasAction := false
 	for _, w := range actionWords {
 		if strings.Contains(lower, w) {
 			hasAction = true
 			break
 		}
 	}
+	hasTech := false
 	for _, w := range techWords {
 		if strings.Contains(lower, w) {
 			hasTech = true
@@ -414,7 +453,6 @@ func (a *Agent) DecideTool(input string) string {
 	return "search"
 }
 
-// ExecuteWithContext 执行工具，并传递会话ID以获取历史
 func (a *Agent) ExecuteWithContext(ctx context.Context, convID, input string) (string, error) {
 	start := time.Now()
 	defer func() { taskDuration.Observe(time.Since(start).Seconds()) }()
@@ -424,7 +462,6 @@ func (a *Agent) ExecuteWithContext(ctx context.Context, convID, input string) (s
 		return a.executeWorkflow(ctx, convID)
 	}
 
-	// 根据工具类型，注入会话ID（用于获取历史）
 	var tool Tool
 	switch toolName {
 	case "code_generator":
@@ -493,7 +530,7 @@ func (a *Agent) executeWorkflow(ctx context.Context, convID string) (string, err
 	if err := w.Execute(ctx); err != nil {
 		return "", err
 	}
-	return fmt.Sprintf("✅ 工作流完成！\n📦 下载：%s\n🖼️ 截图：%s", w.State["package_url"], w.State["screenshot_url"]), nil
+	return fmt.Sprintf("工作流完成。\n下载链接：%s\n截图预览：%s", w.State["package_url"], w.State["screenshot_url"]), nil
 }
 
 // ========== 全局变量与 Worker ==========
@@ -514,7 +551,6 @@ func startWorker() {
 				cache.SetTaskCache(task)
 
 				ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
-				// 使用带会话ID的执行方法
 				result, err := agent.ExecuteWithContext(ctx, task.ConversationID, task.Input)
 				cancel()
 
@@ -682,6 +718,6 @@ func main() {
 	if port == "" {
 		port = "8080"
 	}
-	log.Printf("🚀 Server started on :%s", port)
+	log.Printf("Server started on :%s", port)
 	r.Run(":" + port)
 }
