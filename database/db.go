@@ -5,7 +5,7 @@ import (
 	"os"
 	"time"
 
-	"agent/models"
+	"aicodeagent/models"
 
 	"gorm.io/driver/mysql"
 	"gorm.io/gorm"

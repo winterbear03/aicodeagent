@@ -8,8 +8,8 @@ import (
 	"sync"
 	"time"
 
-	"agent/database"
-	"agent/models"
+	"aicodeagent/database"
+	"aicodeagent/models"
 
 	"github.com/redis/go-redis/v9"
 )

@@ -19,13 +19,15 @@ import (
 	"syscall"
 	"time"
 
-	"agent/cache"
-	"agent/database"
-	"agent/models"
-	"agent/websocket"
+	"aicodeagent/cache"
+	"aicodeagent/database"
+	"aicodeagent/models"
+	"aicodeagent/websocket"
 
 	"github.com/chromedp/chromedp"
 	"github.com/gin-gonic/gin"
+	"github.com/mark3labs/mcp-go/mcp"
+	"github.com/mark3labs/mcp-go/server"
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
 	"github.com/prometheus/client_golang/prometheus"
@@ -78,7 +80,7 @@ type Tool interface {
 	Execute(ctx context.Context, input string) (string, error)
 }
 
-// ---------- 代码生成工具（支持上下文）----------
+// ---------- 代码生成工具 ----------
 type CodeGenTool struct {
 	ConversationID string
 }
@@ -88,7 +90,6 @@ func (t CodeGenTool) Description() string { return "调用大模型生成代码"
 func (t CodeGenTool) Execute(ctx context.Context, input string) (string, error) {
 	history := getConversationHistory(t.ConversationID)
 	code := callZhipuAIWithHistory(input, history)
-
 	if code == "" || strings.HasPrefix(code, "[ERROR]") || strings.HasPrefix(code, "AI returned empty") {
 		return code, nil
 	}
@@ -102,7 +103,6 @@ func getConversationHistory(convID string) []map[string]string {
 	var tasks []models.Task
 	database.DB.Where("conversation_id = ? AND status = ?", convID, "done").
 		Order("created_at asc").Find(&tasks)
-
 	var history []map[string]string
 	for _, t := range tasks {
 		history = append(history, map[string]string{"role": "user", "content": t.Input})
@@ -116,7 +116,6 @@ func callZhipuAIWithHistory(prompt string, history []map[string]string) string {
 	if apiKey == "" {
 		return "[ERROR] ZHIPU_API_KEY not set"
 	}
-
 	messages := []map[string]string{
 		{"role": "system", "content": "你是一个专业的编程助手，擅长生成各类代码。如果用户追问或要求修改，请基于之前的对话内容进行回答。"},
 	}
@@ -151,7 +150,6 @@ func callZhipuAIWithHistory(prompt string, history []map[string]string) string {
 			},
 		},
 	}
-
 	resp, err := client.Do(req)
 	if err != nil {
 		return fmt.Sprintf("AI 调用失败: %v", err)
@@ -265,7 +263,7 @@ func main() {
 var minioClient *minio.Client
 var bucketName = "ai-platform"
 
-func initMinIO() {
+func InitMinIO() {
 	endpoint := os.Getenv("MINIO_ENDPOINT")
 	if endpoint == "" {
 		log.Println("[WARN] MINIO_ENDPOINT 未设置，截图/打包功能将受限")
@@ -289,7 +287,6 @@ func initMinIO() {
 		minioClient = nil
 		return
 	}
-
 	ctx := context.Background()
 	exists, _ := minioClient.BucketExists(ctx, bucketName)
 	if !exists {
@@ -302,7 +299,6 @@ func uploadCodeToMinIO(ctx context.Context, code string) (string, error) {
 	if minioClient == nil {
 		return code + "\n\n[WARN] MinIO 未连接", nil
 	}
-
 	contentType := "text/plain"
 	fileExt := ".txt"
 	if strings.Contains(code, "package main") {
@@ -312,7 +308,6 @@ func uploadCodeToMinIO(ctx context.Context, code string) (string, error) {
 		contentType = "text/html"
 		fileExt = ".html"
 	}
-
 	objectName := fmt.Sprintf("codes/%d%s", time.Now().UnixNano(), fileExt)
 	_, err := minioClient.PutObject(ctx, bucketName, objectName, bytes.NewReader([]byte(code)), int64(len(code)), minio.PutObjectOptions{
 		ContentType: contentType,
@@ -320,10 +315,8 @@ func uploadCodeToMinIO(ctx context.Context, code string) (string, error) {
 	if err != nil {
 		return code + "\n\n[ERROR] 上传失败", nil
 	}
-
 	reqParams := make(url.Values)
 	presignedURL, _ := minioClient.PresignedGetObject(ctx, bucketName, objectName, 7*24*time.Hour, reqParams)
-
 	externalEndpoint := os.Getenv("MINIO_EXTERNAL_ENDPOINT")
 	if externalEndpoint != "" {
 		presignedURL.Host = externalEndpoint
@@ -388,13 +381,19 @@ func (w *Workflow) Execute(ctx context.Context) error {
 	return nil
 }
 
-// ========== Agent 核心（扩展触发词） ==========
+// ========== Agent 核心 ==========
 type Agent struct {
-	tools map[string]Tool
+	tools          map[string]Tool
+	tasksProcessed *prometheus.CounterVec
+	taskDuration   prometheus.Histogram
 }
 
-func NewAgent() *Agent {
-	a := &Agent{tools: make(map[string]Tool)}
+func NewAgent(tp *prometheus.CounterVec, td prometheus.Histogram) *Agent {
+	a := &Agent{
+		tools:          make(map[string]Tool),
+		tasksProcessed: tp,
+		taskDuration:   td,
+	}
 	a.Register(CodeGenTool{})
 	a.Register(NewSearchTool())
 	a.Register(ScreenshotTool{})
@@ -405,19 +404,14 @@ func (a *Agent) Register(t Tool) { a.tools[t.Name()] = t }
 
 func (a *Agent) DecideTool(input string) string {
 	lower := strings.ToLower(input)
-
-	// 截图
 	if strings.Contains(lower, "截图") || strings.Contains(lower, "screenshot") ||
 		strings.Contains(lower, "capture") || strings.Contains(lower, "预览") {
 		return "screenshot"
 	}
-	// 打包/下载
 	if strings.Contains(lower, "打包") || strings.Contains(lower, "package") ||
 		strings.Contains(lower, "下载") || strings.Contains(lower, "bundle") {
 		return "workflow"
 	}
-
-	// 代码生成：丰富的中文动作词 + 技术栈关键词
 	actionWords := []string{
 		"写", "生成", "实现", "创建", "开发", "编写", "帮我", "输出",
 		"改成", "修改", "加上", "去掉", "优化", "重构",
@@ -432,7 +426,6 @@ func (a *Agent) DecideTool(input string) string {
 		"node", "django", "flask", "spring", "rust", "typescript",
 		"hello world", "rest", "grpc", "gorm", "docker", "k8s",
 	}
-
 	hasAction := false
 	for _, w := range actionWords {
 		if strings.Contains(lower, w) {
@@ -455,13 +448,12 @@ func (a *Agent) DecideTool(input string) string {
 
 func (a *Agent) ExecuteWithContext(ctx context.Context, convID, input string) (string, error) {
 	start := time.Now()
-	defer func() { taskDuration.Observe(time.Since(start).Seconds()) }()
+	defer func() { a.taskDuration.Observe(time.Since(start).Seconds()) }()
 
 	toolName := a.DecideTool(input)
 	if toolName == "workflow" {
 		return a.executeWorkflow(ctx, convID)
 	}
-
 	var tool Tool
 	switch toolName {
 	case "code_generator":
@@ -475,13 +467,12 @@ func (a *Agent) ExecuteWithContext(ctx context.Context, convID, input string) (s
 	default:
 		return "未找到合适的工具", nil
 	}
-
 	result, err := tool.Execute(ctx, input)
 	if err != nil {
-		tasksProcessed.WithLabelValues("failed").Inc()
+		a.tasksProcessed.WithLabelValues("failed").Inc()
 		return "", err
 	}
-	tasksProcessed.WithLabelValues("success").Inc()
+	a.tasksProcessed.WithLabelValues("success").Inc()
 	return result, nil
 }
 
@@ -533,9 +524,92 @@ func (a *Agent) executeWorkflow(ctx context.Context, convID string) (string, err
 	return fmt.Sprintf("工作流完成。\n下载链接：%s\n截图预览：%s", w.State["package_url"], w.State["screenshot_url"]), nil
 }
 
+// ========== MCP 服务 ==========
+func getStringArg(request mcp.CallToolRequest, key string) string {
+	args, ok := request.Params.Arguments.(map[string]interface{})
+	if !ok {
+		return ""
+	}
+	v, _ := args[key].(string)
+	return v
+}
+
+func startMCPServer(r *gin.Engine, ag *Agent) {
+	s := server.NewMCPServer(
+		"AI Code Agent",
+		"1.0.0",
+		server.WithToolCapabilities(true),
+	)
+
+	// 注册代码生成工具
+	codeGenTool := mcp.NewTool("code_generator",
+		mcp.WithDescription("调用大模型生成代码"),
+		mcp.WithString("prompt", mcp.Required(), mcp.Description("代码需求描述")),
+	)
+	s.AddTool(codeGenTool, server.ToolHandlerFunc(func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		prompt := getStringArg(request, "prompt")
+		result, err := ag.ExecuteWithContext(ctx, "", prompt)
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		return mcp.NewToolResultText(result), nil
+	}))
+
+	// 注册搜索工具
+	searchTool := mcp.NewTool("search",
+		mcp.WithDescription("搜索本地知识库"),
+		mcp.WithString("query", mcp.Required(), mcp.Description("搜索关键词")),
+	)
+	s.AddTool(searchTool, server.ToolHandlerFunc(func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		query := getStringArg(request, "query")
+		result, err := ag.ExecuteWithContext(ctx, "", query)
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		return mcp.NewToolResultText(result), nil
+	}))
+
+	// 注册截图工具
+	screenshotTool := mcp.NewTool("screenshot",
+		mcp.WithDescription("对 HTML 进行截图，返回图片 URL"),
+		mcp.WithString("html", mcp.Required(), mcp.Description("要截图的 HTML 内容")),
+	)
+	s.AddTool(screenshotTool, server.ToolHandlerFunc(func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		html := getStringArg(request, "html")
+		result, err := ag.ExecuteWithContext(ctx, "", html)
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		return mcp.NewToolResultText(result), nil
+	}))
+
+	// 注册打包工具
+	packageTool := mcp.NewTool("package",
+		mcp.WithDescription("打包代码为 ZIP，返回下载链接"),
+		mcp.WithString("input", mcp.Required(), mcp.Description("打包输入")),
+	)
+	s.AddTool(packageTool, server.ToolHandlerFunc(func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		input := getStringArg(request, "input")
+		result, err := ag.ExecuteWithContext(ctx, "", input)
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		return mcp.NewToolResultText(result), nil
+	}))
+
+	sseServer := server.NewSSEServer(s)
+	r.Any("/mcp/sse", func(c *gin.Context) {
+		sseServer.ServeHTTP(c.Writer, c.Request)
+	})
+	r.Any("/mcp/message", func(c *gin.Context) {
+		sseServer.ServeHTTP(c.Writer, c.Request)
+	})
+	log.Println("[MCP] 服务已启动，端点: /mcp/sse 和 /mcp/message")
+}
+
 // ========== 全局变量与 Worker ==========
 var (
-	agent     *Agent
+	ag        *Agent
 	wsManager *websocket.Manager
 	taskQueue = make(chan models.Task, 100)
 	wg        sync.WaitGroup
@@ -551,7 +625,7 @@ func startWorker() {
 				cache.SetTaskCache(task)
 
 				ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
-				result, err := agent.ExecuteWithContext(ctx, task.ConversationID, task.Input)
+				result, err := ag.ExecuteWithContext(ctx, task.ConversationID, task.Input)
 				cancel()
 
 				if err != nil {
@@ -628,7 +702,6 @@ func handleDeleteTask(c *gin.Context) {
 	c.JSON(200, gin.H{"msg": "deleted"})
 }
 
-// 会话相关
 func handleCreateConversation(c *gin.Context) {
 	conv := models.Conversation{
 		ID:        fmt.Sprintf("conv_%d", time.Now().UnixNano()),
@@ -680,9 +753,9 @@ func truncateString(s string, maxLen int) string {
 func main() {
 	database.InitDB()
 	cache.InitRedis()
-	initMinIO()
+	InitMinIO()
 
-	agent = NewAgent()
+	ag = NewAgent(tasksProcessed, taskDuration)
 	wsManager = websocket.NewManager()
 	go wsManager.Run()
 	startWorker()
@@ -703,6 +776,8 @@ func main() {
 	r.GET("/conversations", handleListConversations)
 	r.GET("/conversations/:id/messages", handleGetConversationMessages)
 	r.DELETE("/conversations/:id", handleDeleteConversation)
+
+	startMCPServer(r, ag)
 
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
