@@ -597,7 +597,7 @@ func startMCPServer(r *gin.Engine, ag *Agent) {
 		return mcp.NewToolResultText(result), nil
 	}))
 
-	sseServer := server.NewSSEServer(s)
+	sseServer := server.NewSSEServer(s, server.WithStaticBasePath("/mcp"))
 	r.Any("/mcp/sse", func(c *gin.Context) {
 		sseServer.ServeHTTP(c.Writer, c.Request)
 	})

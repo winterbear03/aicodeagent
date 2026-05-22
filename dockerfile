@@ -12,7 +12,7 @@ RUN go mod download
 
 COPY . .
 
-RUN go build -ldflags="-s -w" -o server agent.go
+RUN go build -ldflags="-s -w" -o server main.go
 
 # 第二阶段：运行环境
 FROM alpine:latest
